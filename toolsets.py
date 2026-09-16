@@ -217,6 +217,10 @@ TOOLSETS = {
         _CODING_TOOLS,
         posture=True,
         routing_keywords=["code", "repository", "implement", "test", "build", "refactor", "fix bug", "pull request"],
+        routing_tools=[
+            "terminal", "process_manage", "read_file", "write_file", "patch", "search_files",
+            "skills_list", "skill_view", "todo_list", "execute_code", "delegate_task",
+        ],
     ),
 
     # Full Hermes toolsets (CLI + messaging platforms). All share the core tools;
@@ -483,7 +487,12 @@ def get_capability_manifests() -> Dict[str, Dict[str, Any]]:
             # transport rather than the user's intent.
             continue
         manifest = dict(toolset)
-        manifest["tools"] = resolve_toolset(name)
+        manifest["tools"] = list(manifest.get("routing_tools") or resolve_toolset(name))
+        raw_keywords = manifest.get("routing_keywords")
+        keywords: List[str] = [raw_keywords] if isinstance(raw_keywords, str) else list(raw_keywords or ())
+        if name not in keywords:
+            keywords.append(name)
+        manifest["routing_keywords"] = keywords
         manifests[name] = manifest
     return manifests
 
