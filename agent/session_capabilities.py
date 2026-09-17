@@ -21,7 +21,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
-CAPABILITY_PLAN_VERSION = 1
+CAPABILITY_PLAN_VERSION = 2
 _CONFIG_KEY = "capability_plan"
 _DEFAULT_KERNEL_TOOLS = (
     "clarify",
@@ -135,6 +135,7 @@ class CapabilityPlan:
     wire_tool_defs: tuple[dict[str, Any], ...] = ()
     fallback_tool_defs: tuple[dict[str, Any], ...] = ()
     tool_schema_hash: str = ""
+    plan_hash: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -149,6 +150,7 @@ class CapabilityPlan:
             "wire_tool_defs": json.loads(_canonical_json(self.wire_tool_defs)),
             "fallback_tool_defs": json.loads(_canonical_json(self.fallback_tool_defs)),
             "tool_schema_hash": self.tool_schema_hash,
+            "plan_hash": self.plan_hash,
         }
 
     @classmethod
@@ -167,12 +169,43 @@ class CapabilityPlan:
             wire_tool_defs=_copy_defs(value.get("wire_tool_defs")),
             fallback_tool_defs=_copy_defs(value.get("fallback_tool_defs")),
             tool_schema_hash=str(value.get("tool_schema_hash") or ""),
+            plan_hash=str(value.get("plan_hash") or ""),
         )
-        if plan.wire_tool_defs:
-            actual = _canonical_hash(plan.wire_tool_defs)
-            if not plan.tool_schema_hash or actual != plan.tool_schema_hash:
-                raise ValueError("capability plan tool schema hash mismatch")
+        _validate_plan(plan)
         return plan
+
+
+def _plan_hash(plan: CapabilityPlan) -> str:
+    payload = plan.to_dict()
+    payload.pop("plan_hash", None)
+    return _canonical_hash(payload)
+
+
+def _validate_plan(plan: CapabilityPlan, *, require_frozen: bool = False) -> None:
+    direct = tuple(plan.direct_tools)
+    deferred = tuple(plan.deferred_tools)
+    if len(set(direct)) != len(direct) or len(set(deferred)) != len(deferred):
+        raise ValueError("capability plan contains duplicate tool names")
+    if set(direct) & set(deferred):
+        raise ValueError("capability plan direct and deferred tools overlap")
+    if not plan.wire_tool_defs and not plan.fallback_tool_defs and not plan.tool_schema_hash:
+        if require_frozen:
+            raise ValueError("capability plan has no persisted wire tool definitions")
+        return
+    fallback_names = tuple(
+        name for name in (_tool_name(item) for item in plan.fallback_tool_defs) if name
+    )
+    if set(fallback_names) != set(deferred) or len(fallback_names) != len(deferred):
+        raise ValueError("capability plan fallback schemas do not match deferred tools")
+    wire_names = {
+        name for name in (_tool_name(item) for item in plan.wire_tool_defs) if name
+    }
+    if not set(direct).issubset(wire_names):
+        raise ValueError("capability plan wire schemas omit a direct tool")
+    if plan.tool_schema_hash != _canonical_hash(plan.wire_tool_defs):
+        raise ValueError("capability plan tool schema hash mismatch")
+    if not plan.plan_hash or plan.plan_hash != _plan_hash(plan):
+        raise ValueError("capability plan integrity hash mismatch")
 
 
 def build_capability_plan(
@@ -326,10 +359,21 @@ def _persisted_plan(agent: Any) -> CapabilityPlan | None:
 
 def apply_capability_plan(agent: Any, plan: CapabilityPlan) -> None:
     """Atomically publish a frozen routed tool snapshot on an agent."""
-    if not plan.wire_tool_defs:
-        raise ValueError("capability plan has no persisted wire tool definitions")
-    if _canonical_hash(plan.wire_tool_defs) != plan.tool_schema_hash:
-        raise ValueError("capability plan tool schema hash mismatch")
+    _validate_plan(plan, require_frozen=True)
+    current_defs = tuple(getattr(agent, "_authorized_tool_defs_snapshot", ()) or ())
+    current_defs += tuple(getattr(agent, "tools", ()) or ())
+    if current_defs:
+        current_names = {
+            name for name in (_tool_name(item) for item in current_defs) if name
+        }
+        unavailable = sorted(
+            (set(plan.direct_tools) | set(plan.deferred_tools)) - current_names
+        )
+        if unavailable:
+            raise ValueError(
+                "capability plan contains tools no longer authorized or available: "
+                + ", ".join(unavailable)
+            )
     wire = [json.loads(_canonical_json(tool_def)) for tool_def in plan.wire_tool_defs]
     fallback = tuple(json.loads(_canonical_json(tool_def)) for tool_def in plan.fallback_tool_defs)
     bridge_defs = list(fallback)
@@ -399,12 +443,13 @@ def _build_session_plan(agent: Any, user_message: Any) -> CapabilityPlan:
     deferred_set = frozenset(plan.deferred_tools)
     fallback = tuple(tool_def for tool_def in definitions if _tool_name(tool_def) in deferred_set)
     frozen_wire = _copy_defs(wire)
-    return replace(
+    frozen = replace(
         plan,
         wire_tool_defs=frozen_wire,
         fallback_tool_defs=_copy_defs(fallback),
         tool_schema_hash=_canonical_hash(frozen_wire),
     )
+    return replace(frozen, plan_hash=_plan_hash(frozen))
 
 
 def ensure_session_capability_plan(

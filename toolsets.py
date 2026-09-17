@@ -494,6 +494,23 @@ def get_capability_manifests() -> Dict[str, Dict[str, Any]]:
             keywords.append(name)
         manifest["routing_keywords"] = keywords
         manifests[name] = manifest
+    # Plugins contribute metadata only. Resolve their declared toolsets here,
+    # then the session planner intersects these names with its immutable,
+    # already-authorized tool snapshot.
+    try:
+        from hermes_cli.plugins import get_registered_capability_manifests
+        plugin_manifests = get_registered_capability_manifests()
+    except Exception:
+        plugin_manifests = {}
+    for name, registered in sorted(plugin_manifests.items()):
+        if name in manifests:
+            continue
+        resolved: Set[str] = set(registered.get("tools") or ())
+        for toolset_name in registered.get("toolsets") or ():
+            resolved.update(resolve_toolset(toolset_name))
+        manifest = dict(registered)
+        manifest["tools"] = sorted(resolved)
+        manifests[name] = manifest
     return manifests
 
 

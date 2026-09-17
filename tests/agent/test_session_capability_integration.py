@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import hashlib
+import pytest
 from dataclasses import replace
 from types import SimpleNamespace
 
 from agent.session_capabilities import (
+    CAPABILITY_PLAN_VERSION,
     CapabilityPlan,
     _build_session_plan,
+    _plan_hash,
     apply_capability_plan,
     ensure_session_capability_plan,
 )
@@ -29,8 +32,8 @@ def _plan() -> CapabilityPlan:
     wire = (_tool("clarify"), _tool("tool_search"), _tool("tool_describe"), _tool("tool_call"))
     fallback = (_tool("terminal"),)
     canonical = json.dumps(list(wire), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return CapabilityPlan(
-        version=1,
+    plan = CapabilityPlan(
+        version=CAPABILITY_PLAN_VERSION,
         direct_tools=("clarify",),
         deferred_tools=("terminal",),
         matched_toolsets=(),
@@ -42,6 +45,7 @@ def _plan() -> CapabilityPlan:
         wire_tool_defs=wire,
         fallback_tool_defs=fallback,
     )
+    return replace(plan, plan_hash=_plan_hash(plan))
 
 
 def test_resume_reads_capability_plan_from_real_session_db(tmp_path):
@@ -117,7 +121,7 @@ def test_dynamic_kernel_tool_is_not_duplicated_in_wire_schema(monkeypatch):
 
 def test_direct_connection_manager_keeps_connector_bridge_authorized():
     import model_tools
-    from tools.tool_gateway.names import CONNECTOR_BATCH_SENTINEL
+    from tools.connectors import CONNECTOR_BATCH_SENTINEL
 
     base = _plan()
     wire = tuple(base.wire_tool_defs) + (_tool("manage_connections"),)
@@ -128,6 +132,7 @@ def test_direct_connection_manager_keeps_connector_bridge_authorized():
         wire_tool_defs=wire,
         tool_schema_hash=hashlib.sha256(canonical.encode()).hexdigest()[:16],
     )
+    plan = replace(plan, plan_hash=_plan_hash(plan))
     agent = SimpleNamespace(tools=[], valid_tool_names=set())
     apply_capability_plan(agent, plan)
 
@@ -143,6 +148,23 @@ def test_direct_connection_manager_keeps_connector_bridge_authorized():
     assert result is None
     assert isinstance(underlying, tuple)
     assert underlying[0] == CONNECTOR_BATCH_SENTINEL
+
+
+def test_persisted_plan_integrity_covers_fallback_and_skills():
+    payload = _plan().to_dict()
+    payload["selected_skills"] = ["injected-skill"]
+    with pytest.raises(ValueError, match="integrity hash"):
+        CapabilityPlan.from_dict(payload)
+
+
+def test_resume_fails_closed_when_authorized_tool_disappears():
+    agent = SimpleNamespace(
+        tools=[_tool("clarify")],
+        valid_tool_names={"clarify"},
+        _authorized_tool_defs_snapshot=(_tool("clarify"),),
+    )
+    with pytest.raises(ValueError, match="no longer authorized or available"):
+        apply_capability_plan(agent, _plan())
 
 
 def test_skill_visibility_uses_authorized_not_only_direct_tools(monkeypatch):
