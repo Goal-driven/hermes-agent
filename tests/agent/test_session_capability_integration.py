@@ -167,6 +167,16 @@ def test_resume_fails_closed_when_authorized_tool_disappears():
         apply_capability_plan(agent, _plan())
 
 
+def test_resume_fails_closed_when_authorization_scope_is_empty():
+    agent = SimpleNamespace(
+        tools=[],
+        valid_tool_names=set(),
+        _authorized_tool_defs_snapshot=(),
+    )
+    with pytest.raises(ValueError, match="no longer authorized or available"):
+        apply_capability_plan(agent, _plan())
+
+
 def test_skill_visibility_uses_authorized_not_only_direct_tools(monkeypatch):
     from agent import system_prompt
 

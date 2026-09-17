@@ -360,9 +360,10 @@ def _persisted_plan(agent: Any) -> CapabilityPlan | None:
 def apply_capability_plan(agent: Any, plan: CapabilityPlan) -> None:
     """Atomically publish a frozen routed tool snapshot on an agent."""
     _validate_plan(plan, require_frozen=True)
-    current_defs = tuple(getattr(agent, "_authorized_tool_defs_snapshot", ()) or ())
+    authorized_snapshot = getattr(agent, "_authorized_tool_defs_snapshot", None)
+    current_defs = tuple(authorized_snapshot or ())
     current_defs += tuple(getattr(agent, "tools", ()) or ())
-    if current_defs:
+    if authorized_snapshot is not None:
         current_names = {
             name for name in (_tool_name(item) for item in current_defs) if name
         }
