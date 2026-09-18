@@ -103,6 +103,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/steer", adapter._handle_steer_run)
+    app.router.add_post("/v1/runs/{run_id}/redirect", adapter._handle_redirect_run)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
 
@@ -612,6 +613,73 @@ class TestSteerRun:
         assert payload["error"]["code"] == "invalid_steer_input"
         agent.steer.assert_not_called()
 
+
+class TestRedirectRun:
+    @pytest.mark.asyncio
+    async def test_redirect_running_agent_emits_distinct_control_event(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.redirect.return_value = True
+        queue = asyncio.Queue()
+        adapter._active_run_agents["run_123"] = agent
+        adapter._run_streams["run_123"] = queue
+        adapter._set_run_status("run_123", "running")
+        _claim_run(adapter, "run_123")
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs/run_123/redirect", json={"input": "answer only in Swedish"})
+            payload = await resp.json()
+
+        assert resp.status == 200
+        assert payload == {
+            "object": "hermes.run.redirect",
+            "run_id": "run_123",
+            "accepted": True,
+        }
+        agent.redirect.assert_called_once_with("answer only in Swedish")
+        agent.steer.assert_not_called()
+        assert adapter._run_statuses["run_123"]["last_event"] == "run.redirected"
+        assert (event := queue.get_nowait())["event"] == "run.redirected"
+        assert event["run_id"] == "run_123"
+        assert event["accepted"] is True
+
+    @pytest.mark.asyncio
+    async def test_redirect_rejects_terminal_missing_or_refused_agent(self, adapter):
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.redirect.return_value = False
+        adapter._active_run_agents["run_running"] = agent
+        adapter._set_run_status("run_running", "running")
+        _claim_run(adapter, "run_running")
+        adapter._set_run_status("run_done", "completed")
+        _claim_run(adapter, "run_done")
+
+        async with TestClient(TestServer(app)) as cli:
+            missing = await (await cli.post(
+                "/v1/runs/run_missing/redirect", json={"input": "hello"})).json()
+            terminal = await (await cli.post(
+                "/v1/runs/run_done/redirect", json={"input": "hello"})).json()
+            refused = await (await cli.post(
+                "/v1/runs/run_running/redirect", json={"input": "hello"})).json()
+            empty = await (await cli.post(
+                "/v1/runs/run_running/redirect", json={"input": ""})).json()
+
+        assert missing["error"]["code"] == "run_not_found"
+        assert terminal["error"]["code"] == "run_not_accepting_redirect"
+        assert refused["error"]["code"] == "redirect_not_accepted"
+        assert empty["error"]["code"] == "invalid_redirect_input"
+        agent.redirect.assert_called_once_with("hello")
+
+    @pytest.mark.asyncio
+    async def test_redirect_requires_auth(self, auth_adapter):
+        app = _create_runs_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post("/v1/runs/run_any/redirect", json={"input": "hello"})
+
+        assert response.status == 401
+
+
+class TestSteerRunLifecycle:
     @pytest.mark.asyncio
     async def test_stop_then_steer_rejects_retained_agent_ref(self, adapter):
         """Steer must reject a stopping run even if the executor thread is still live."""
