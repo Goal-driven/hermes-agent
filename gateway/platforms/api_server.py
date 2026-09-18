@@ -66,6 +66,7 @@ _BROWSER_CONTROL_PROTOCOL_VERSION = 1
 # /v1/capabilities static feature flags (order is part of the JSON shape).
 _STATIC_FEATURE_FLAGS = {
     "run_status": True, "run_events_sse": True, "run_stop": True, "run_steer": True,
+    "run_redirect": True,
     "run_approval_response": True, "tool_progress_events": True, "approval_events": True,
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
@@ -83,6 +84,7 @@ _CAPABILITY_ENDPOINTS = (
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
+    ("run_redirect", ("POST", "/v1/runs/{run_id}/redirect")),
     ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
     ("session_create", ("POST", "/api/sessions")),
@@ -3860,6 +3862,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
+    _handle_redirect_run = _run_route_delegate("_handle_redirect_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
 
     async def _sweep_orphaned_runs(self) -> None:
