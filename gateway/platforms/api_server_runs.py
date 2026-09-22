@@ -1,6 +1,7 @@
 """Durable ``/v1/runs`` admission, status, events, and control handlers."""
 
 import asyncio
+from collections import OrderedDict
 import hashlib
 import json
 import logging
@@ -48,6 +49,7 @@ _FIXED_EVENT_FIELDS = {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
 _TOOL_COMPLETED_PREVIEW_MAX_CHARS = 500
+_RUN_AGENT_CACHE_MAX_SIZE = 32
 
 
 def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., str]) -> str:
@@ -132,6 +134,11 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    # /v1/runs owns its agents instead of going through TurnRunner's cache. Keep one idle
+    # agent per conversation so sequential API turns retain the provider connection pool and
+    # prompt cache. Checkout removes the entry, so concurrent runs can never share callbacks,
+    # mutable turn state, or a tool executor.
+    self._run_agent_cache = OrderedDict()
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -152,11 +159,67 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    for agent, _signature in getattr(self, "_run_agent_cache", {}).values():
+        with suppress(Exception):
+            agent.release_clients()
+    getattr(self, "_run_agent_cache", {}).clear()
     try:
         if getattr(self, "_run_idempotency_store", None) is not None:
             self._run_idempotency_store.close()
     except Exception:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
+
+
+def _run_agent_cache_key(run: "_RunLaunch") -> tuple[str, str]:
+    """Profile + resolved conversation id; run-id fallback sessions naturally never hit."""
+    return str(run.request_profile or "default"), str(run.session_id)
+
+
+def _wire_cached_run_agent(agent, fresh, text_callback, tool_callback) -> None:
+    """Apply mutable per-turn configuration from the freshly resolved agent."""
+    from gateway.run import GatewayRunner
+
+    GatewayRunner._init_cached_agent_for_turn(agent, 0)
+    for name in (
+        "max_iterations", "reasoning_config", "service_tier", "request_overrides",
+        "tool_start_callback", "tool_complete_callback",
+    ):
+        setattr(agent, name, getattr(fresh, name, None))
+    agent.stream_delta_callback = text_callback
+    agent.tool_progress_callback = tool_callback
+    agent._hermes_api_runtime = dict(getattr(fresh, "_hermes_api_runtime", {}) or {})
+
+
+def _checkout_run_agent(self, run: "_RunLaunch", fresh, signature: str, text_callback, tool_callback):
+    """Return an exclusive warm agent when its frozen prompt/tool config still matches."""
+    cache = self._run_agent_cache
+    cached = cache.pop(_run_agent_cache_key(run), None)
+    if cached is None:
+        return fresh, False
+    agent, cached_signature = cached
+    if cached_signature != signature:
+        with suppress(Exception):
+            agent.release_clients()
+        return fresh, False
+    _wire_cached_run_agent(agent, fresh, text_callback, tool_callback)
+    with suppress(Exception):
+        fresh.release_clients()
+    return agent, True
+
+
+def _checkin_run_agent(self, run: "_RunLaunch", agent, signature: str) -> None:
+    """Retain one successful idle agent per conversation and bound total resident pools."""
+    cache = self._run_agent_cache
+    key = _run_agent_cache_key(run)
+    displaced = cache.pop(key, None)
+    cache[key] = (agent, signature)
+    if displaced is not None and displaced[0] is not agent:
+        with suppress(Exception):
+            displaced[0].release_clients()
+    while len(cache) > _RUN_AGENT_CACHE_MAX_SIZE:
+        _old_key, (old_agent, _old_signature) = cache.popitem(last=False)
+        with suppress(Exception):
+            old_agent.release_clients()
 
 
 def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
@@ -562,6 +625,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     from tools.approval_context import reset_current_session_key, set_current_session_key
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
+    usage_before = {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
     with self._profile_scope(run.request_profile):
@@ -612,7 +676,9 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
-        return r, {key: getattr(agent, attr, 0) or 0 for key, attr in _USAGE_FIELDS}
+        return r, {
+            key: max(0, (getattr(agent, attr, 0) or 0) - usage_before[key])
+            for key, attr in _USAGE_FIELDS}
 
 
 def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
@@ -657,15 +723,29 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
 
+    agent = None
+    cache_signature = ""
+    cacheable = False
     try:
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
         with self._profile_scope(run.request_profile):
-            agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                **run.agent_kwargs)
+            setup_started = time.perf_counter()
+            tool_callback = self._make_run_event_callback(run_id, loop)
+            created = self._create_agent(
+                stream_delta_callback=_text_cb, tool_progress_callback=tool_callback,
+                return_cache_signature=True, **run.agent_kwargs)
+            if isinstance(created, tuple) and len(created) == 2:
+                fresh, cache_signature = created
+            else:  # test doubles and older adapter overrides keep the historical return shape
+                fresh, cache_signature = created, ""
+            agent, cache_hit = _checkout_run_agent(
+                self, run, fresh, cache_signature, _text_cb, tool_callback)
+            setup_ms = round((time.perf_counter() - setup_started) * 1000, 2)
+        self._set_run_status(
+            run_id, "running", agent_cache_hit=cache_hit, agent_setup_ms=setup_ms)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage = await loop.run_in_executor(
@@ -680,6 +760,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish("failed", fields, error=_redact_api_error_text(result.get("error") or "agent run failed"))
         else:
             _finish(status, fields, output=result.get("final_response", ""), usage=usage)
+            cacheable = status == "completed"
     except asyncio.CancelledError:
         _finish("cancelled")
         raise
@@ -696,6 +777,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         _unregister_approval_notify(run.approval_session_key)
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
+        if cacheable and agent is not None:
+            _checkin_run_agent(self, run, agent, cache_signature)
         _retire_live_run(self, run_id)
 
 

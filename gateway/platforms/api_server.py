@@ -2133,7 +2133,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         model_options: Optional[Dict[str, Any]] = None, route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None, confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
-        room_execution_policy: Optional[Dict[str, Any]] = None) -> Any:
+        room_execution_policy: Optional[Dict[str, Any]] = None,
+        return_cache_signature: bool = False) -> Any:
         """Create an AIAgent from the gateway runtime config + platform toolsets.
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
@@ -2197,7 +2198,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
             "route_source": route_source}
-        return agent
+        if not return_cache_signature:
+            return agent
+        cache_signature = GatewayRunner._agent_config_signature(
+            model, runtime_kwargs, enabled_toolsets, ephemeral_system_prompt or "",
+            cache_keys=GatewayRunner._extract_cache_busting_config(user_config))
+        return agent, cache_signature
 
     # -- HTTP handlers ----------------------------------------------------------------
 
