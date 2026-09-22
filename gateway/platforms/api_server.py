@@ -2172,6 +2172,22 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # after the precedence chain settles; an explicit request wins.
         if request_reasoning_config is None:
             request_reasoning_config = GatewayRunner._load_reasoning_config(model)
+        request_overrides = dict(runtime_kwargs.get("request_overrides") or {})
+        if request_service_tier is not _REQUEST_OPTION_MISSING:
+            # AIAgent.service_tier controls bounded fast-mode state, while the transport
+            # consumes request_overrides. API requests do not pass through the CLI/gateway
+            # turn-route builder that normally connects those two layers, so bridge them here.
+            request_overrides.pop("service_tier", None)
+            request_overrides.pop("speed", None)
+            if request_service_tier == "priority":
+                from hermes_cli.models import resolve_fast_mode_overrides
+                fast_overrides = resolve_fast_mode_overrides(
+                    model,
+                    provider=runtime_kwargs.get("provider"),
+                    base_url=runtime_kwargs.get("base_url"),
+                )
+                if fast_overrides:
+                    request_overrides.update(fast_overrides)
         agent_kwargs = {
             "model": model, **runtime_kwargs, **_checkpoint_agent_kwargs(user_config),
             "max_iterations": max_iterations, "quiet_mode": True, "verbose_logging": False,
@@ -2186,6 +2202,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Same fallback provider chain as Telegram/Discord/Slack.
             "fallback_model": None if confirmed_runtime_lock else GatewayRunner._load_fallback_model(),
             "reasoning_config": request_reasoning_config,
+            "request_overrides": request_overrides,
             "gateway_session_key": gateway_session_key}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier

@@ -289,6 +289,63 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
 
+    def test_create_agent_bridges_priority_tier_to_transport_overrides(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.6-sol")
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(
+            session_id="api-priority-session",
+            model_options={"service_tier": "priority"},
+        )
+
+        assert captured["service_tier"] == "priority"
+        assert captured["request_overrides"] == {"service_tier": "priority"}
+
+    def test_create_agent_explicit_normal_tier_clears_runtime_priority(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+                "request_overrides": {"service_tier": "priority", "temperature": 0},
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.6-sol")
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        adapter._create_agent(
+            session_id="api-normal-session",
+            model_options={"service_tier": None},
+        )
+
+        assert captured["service_tier"] is None
+        assert captured["request_overrides"] == {"temperature": 0}
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
