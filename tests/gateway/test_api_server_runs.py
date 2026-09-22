@@ -13,6 +13,8 @@ import asyncio
 import hashlib
 import threading
 import time
+from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,8 +29,83 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_runs import (
+    _checkout_run_agent,
+    _run_agent_sync,
+    _run_agent_cache_key,
+)
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
+
+
+def test_run_agent_cache_checkout_is_exclusive_and_rewires_callbacks():
+    adapter = SimpleNamespace(_run_agent_cache={})
+    run = SimpleNamespace(request_profile=None, session_id="voice-session")
+    cached, fresh = MagicMock(), MagicMock()
+    fresh.max_iterations = 4
+    fresh.reasoning_config = {"effort": "none"}
+    fresh.service_tier = "priority"
+    fresh.request_overrides = {"temperature": 0}
+    adapter._run_agent_cache[_run_agent_cache_key(run)] = (cached, "same")
+    text_cb, tool_cb = MagicMock(), MagicMock()
+
+    selected, hit = _checkout_run_agent(adapter, run, fresh, "same", text_cb, tool_cb)
+
+    assert (selected, hit) == (cached, True)
+    assert adapter._run_agent_cache == {}  # a concurrent run cannot borrow the active agent
+    assert cached.stream_delta_callback is text_cb
+    assert cached.tool_progress_callback is tool_cb
+    assert cached.reasoning_config == {"effort": "none"}
+    fresh.release_clients.assert_called_once_with()
+    second_fresh = MagicMock()
+    assert _checkout_run_agent(
+        adapter, run, second_fresh, "same", text_cb, tool_cb
+    ) == (second_fresh, False)
+    stale, fresh = MagicMock(), MagicMock()
+    adapter._run_agent_cache[_run_agent_cache_key(run)] = (stale, "old-config")
+    selected, hit = _checkout_run_agent(
+        adapter, run, fresh, "new-config", MagicMock(), MagicMock())
+    assert (selected, hit) == (fresh, False)
+    stale.release_clients.assert_called_once_with()
+
+
+def test_run_agent_sync_reports_usage_for_current_warm_turn(monkeypatch):
+    agent = MagicMock()
+    agent.session_prompt_tokens = 100
+    agent.session_completion_tokens = 40
+    agent.session_total_tokens = 140
+
+    def run_conversation(**_kwargs):
+        agent.session_prompt_tokens += 12
+        agent.session_completion_tokens += 3
+        agent.session_total_tokens += 15
+        return {"final_response": "done"}
+
+    agent.run_conversation.side_effect = run_conversation
+    owner = SimpleNamespace(
+        _profile_scope=lambda _profile: nullcontext(),
+        _bind_api_server_session=lambda **_kwargs: None,
+        _bind_declared_conversation=MagicMock(),
+    )
+    run = SimpleNamespace(
+        session_id="voice-session", run_id="run-1", request_profile=None,
+        approval_session_key="run-1", session_history_delivery=True,
+        agent_kwargs={"room_dispatch": None, "room_execution_policy": None},
+        user_message="hello", conversation_history=[], turn_author=None,
+        declared_selected=False, gateway_session_key="voice",
+        browser_control_principal=None, browser_control_transport_family=None,
+    )
+    api_server = SimpleNamespace(
+        _publish_turn_process_ownership=MagicMock(),
+        _clear_turn_process_ownership=MagicMock(),
+    )
+    monkeypatch.setattr("tools.approval.register_gateway_notify", lambda *_args: None)
+    monkeypatch.setattr("tools.approval.unregister_gateway_notify", lambda *_args: None)
+
+    _result, usage = _run_agent_sync(
+        owner, run, agent, MagicMock(), _api_server=api_server)
+
+    assert usage == {"input_tokens": 12, "output_tokens": 3, "total_tokens": 15}
 
 
 # ---------------------------------------------------------------------------
